@@ -126,6 +126,7 @@
 
 enum {
   UV__IORING_SETUP_SQPOLL = 2u,
+  UV__IORING_SETUP_NO_SQARRAY = 0x10000u,
 };
 
 enum {
@@ -147,6 +148,7 @@ enum {
   UV__IORING_OP_MKDIRAT = 37,
   UV__IORING_OP_SYMLINKAT = 38,
   UV__IORING_OP_LINKAT = 39,
+  UV__IORING_OP_FTRUNCATE = 55,
 };
 
 enum {
@@ -157,10 +159,6 @@ enum {
 enum {
   UV__IORING_SQ_NEED_WAKEUP = 1u,
   UV__IORING_SQ_CQ_OVERFLOW = 2u,
-};
-
-enum {
-  UV__MKDIRAT_SYMLINKAT_LINKAT = 1u,
 };
 
 struct uv__io_cqring_offsets {
@@ -509,10 +507,13 @@ static void uv__iou_init(int epollfd,
   size_t sqlen;
   size_t maxlen;
   size_t sqelen;
+  unsigned kernel_version;
+  uint32_t* sqarray;
   uint32_t i;
   char* sq;
   char* sqe;
   int ringfd;
+  int no_sqarray;
 
   sq = MAP_FAILED;
   sqe = MAP_FAILED;
@@ -520,11 +521,15 @@ static void uv__iou_init(int epollfd,
   if (!uv__use_io_uring())
     return;
 
+  kernel_version = uv__kernel_version();
+  no_sqarray =
+      UV__IORING_SETUP_NO_SQARRAY * (kernel_version >= /* 6.6 */0x060600);
+
   /* SQPOLL required CAP_SYS_NICE until linux v5.12 relaxed that requirement.
    * Mostly academic because we check for a v5.13 kernel afterwards anyway.
    */
   memset(&params, 0, sizeof(params));
-  params.flags = flags;
+  params.flags = flags | no_sqarray;
 
   if (flags & UV__IORING_SETUP_SQPOLL)
     params.sq_thread_idle = 10;  /* milliseconds */
@@ -586,7 +591,6 @@ static void uv__iou_init(int epollfd,
   iou->sqhead = (uint32_t*) (sq + params.sq_off.head);
   iou->sqtail = (uint32_t*) (sq + params.sq_off.tail);
   iou->sqmask = *(uint32_t*) (sq + params.sq_off.ring_mask);
-  iou->sqarray = (uint32_t*) (sq + params.sq_off.array);
   iou->sqflags = (uint32_t*) (sq + params.sq_off.flags);
   iou->cqhead = (uint32_t*) (sq + params.cq_off.head);
   iou->cqtail = (uint32_t*) (sq + params.cq_off.tail);
@@ -600,13 +604,13 @@ static void uv__iou_init(int epollfd,
   iou->sqelen = sqelen;
   iou->ringfd = ringfd;
   iou->in_flight = 0;
-  iou->flags = 0;
 
-  if (uv__kernel_version() >= /* 5.15.0 */ 0x050F00)
-    iou->flags |= UV__MKDIRAT_SYMLINKAT_LINKAT;
+  if (no_sqarray)
+    return;
 
+  sqarray = (uint32_t*) (sq + params.sq_off.array);
   for (i = 0; i <= iou->sqmask; i++)
-    iou->sqarray[i] = i;  /* Slot -> sqe identity mapping. */
+    sqarray[i] = i;  /* Slot -> sqe identity mapping. */
 
   return;
 
@@ -761,6 +765,14 @@ static struct uv__io_uring_sqe* uv__iou_get_sqe(struct uv__iou* iou,
    * initialization failed. Anything else is a valid ring file descriptor.
    */
   if (iou->ringfd == -2) {
+    /* By default, the SQPOLL is not created. Enable only if the loop is
+     * configured with UV_LOOP_USE_IO_URING_SQPOLL.
+     */
+    if ((loop->flags & UV_LOOP_ENABLE_IO_URING_SQPOLL) == 0) {
+      iou->ringfd = -1;
+      return NULL;
+    }
+
     uv__iou_init(loop->backend_fd, iou, 64, UV__IORING_SETUP_SQPOLL);
     if (iou->ringfd == -2)
       iou->ringfd = -1;  /* "failed" */
@@ -852,6 +864,26 @@ int uv__iou_fs_close(uv_loop_t* loop, uv_fs_t* req) {
 }
 
 
+int uv__iou_fs_ftruncate(uv_loop_t* loop, uv_fs_t* req) {
+  struct uv__io_uring_sqe* sqe;
+  struct uv__iou* iou;
+
+  if (uv__kernel_version() < /* 6.9 */0x060900)
+    return 0;
+
+  iou = &uv__get_internal_fields(loop)->iou;
+  sqe = uv__iou_get_sqe(iou, loop, req);
+  if (sqe == NULL)
+    return 0;
+
+  sqe->fd = req->file;
+  sqe->len = req->off;
+  sqe->opcode = UV__IORING_OP_FTRUNCATE;
+  uv__iou_submit(iou);
+
+  return 1;
+}
+
 int uv__iou_fs_fsync_or_fdatasync(uv_loop_t* loop,
                                   uv_fs_t* req,
                                   uint32_t fsync_flags) {
@@ -881,11 +913,10 @@ int uv__iou_fs_link(uv_loop_t* loop, uv_fs_t* req) {
   struct uv__io_uring_sqe* sqe;
   struct uv__iou* iou;
 
-  iou = &uv__get_internal_fields(loop)->iou;
-
-  if (!(iou->flags & UV__MKDIRAT_SYMLINKAT_LINKAT))
+  if (uv__kernel_version() < /* 5.15.0 */0x050F00)
     return 0;
 
+  iou = &uv__get_internal_fields(loop)->iou;
   sqe = uv__iou_get_sqe(iou, loop, req);
   if (sqe == NULL)
     return 0;
@@ -906,11 +937,10 @@ int uv__iou_fs_mkdir(uv_loop_t* loop, uv_fs_t* req) {
   struct uv__io_uring_sqe* sqe;
   struct uv__iou* iou;
 
-  iou = &uv__get_internal_fields(loop)->iou;
-
-  if (!(iou->flags & UV__MKDIRAT_SYMLINKAT_LINKAT))
+  if (uv__kernel_version() < /* 5.15.0 */0x050F00)
     return 0;
 
+  iou = &uv__get_internal_fields(loop)->iou;
   sqe = uv__iou_get_sqe(iou, loop, req);
   if (sqe == NULL)
     return 0;
@@ -974,11 +1004,10 @@ int uv__iou_fs_symlink(uv_loop_t* loop, uv_fs_t* req) {
   struct uv__io_uring_sqe* sqe;
   struct uv__iou* iou;
 
-  iou = &uv__get_internal_fields(loop)->iou;
-
-  if (!(iou->flags & UV__MKDIRAT_SYMLINKAT_LINKAT))
+  if (uv__kernel_version() < /* 5.15.0 */0x050F00)
     return 0;
 
+  iou = &uv__get_internal_fields(loop)->iou;
   sqe = uv__iou_get_sqe(iou, loop, req);
   if (sqe == NULL)
     return 0;
@@ -1632,12 +1661,12 @@ int uv_resident_set_memory(size_t* rss) {
   long val;
   int rc;
   int i;
-  
+
   /* rss: 24th element */
   rc = uv__slurp("/proc/self/stat", buf, sizeof(buf));
   if (rc < 0)
     return rc;
-    
+
   /* find the last ')' */
   s = strrchr(buf, ')');
   if (s == NULL)
@@ -2256,7 +2285,7 @@ uint64_t uv_get_available_memory(void) {
 }
 
 
-static int uv__get_cgroupv2_constrained_cpu(const char* cgroup, 
+static int uv__get_cgroupv2_constrained_cpu(const char* cgroup,
                                             uv__cpu_constraint* constraint) {
   char path[256];
   char buf[1024];
@@ -2267,7 +2296,7 @@ static int uv__get_cgroupv2_constrained_cpu(const char* cgroup,
 
   if (strncmp(cgroup, "0::/", 4) != 0)
     return UV_EINVAL;
-   
+
   /* Trim ending \n by replacing it with a 0 */
   cgroup_trimmed = cgroup + sizeof("0::/") - 1;      /* Skip the prefix "0::/" */
   cgroup_size = (int)strcspn(cgroup_trimmed, "\n");  /* Find the first slash */
@@ -2319,7 +2348,7 @@ static char* uv__cgroup1_find_cpu_controller(const char* cgroup,
   return cgroup_cpu;
 }
 
-static int uv__get_cgroupv1_constrained_cpu(const char* cgroup, 
+static int uv__get_cgroupv1_constrained_cpu(const char* cgroup,
                                             uv__cpu_constraint* constraint) {
   char path[256];
   char buf[1024];
@@ -2337,8 +2366,8 @@ static int uv__get_cgroupv1_constrained_cpu(const char* cgroup,
            cgroup_size, cgroup_cpu);
 
   if (uv__slurp(path, buf, sizeof(buf)) < 0)
-    return UV_EIO;  
-    
+    return UV_EIO;
+
   if (sscanf(buf, "%lld", &constraint->quota_per_period) != 1)
     return UV_EINVAL;
 
@@ -2360,7 +2389,7 @@ static int uv__get_cgroupv1_constrained_cpu(const char* cgroup,
   /* Read cpu.shares */
   if (uv__slurp(path, buf, sizeof(buf)) < 0)
     return UV_EIO;
-  
+
   if (sscanf(buf, "%u", &shares) != 1)
     return UV_EINVAL;
 

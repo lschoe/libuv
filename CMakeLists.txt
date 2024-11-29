@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.9)
+cmake_minimum_required(VERSION 3.10)
 
 if(POLICY CMP0091)
   cmake_policy(SET CMP0091 NEW) # Enable MSVC_RUNTIME_LIBRARY setting
@@ -81,15 +81,20 @@ if(TSAN)
 endif()
 
 if(UBSAN)
+  cmake_minimum_required(VERSION 3.13)
   list(APPEND uv_defines __UBSAN__=1)
   if(CMAKE_C_COMPILER_ID MATCHES "AppleClang|GNU|Clang")
-    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-omit-frame-pointer -fsanitize=undefined")
-    set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fno-omit-frame-pointer -fsanitize=undefined")
-    set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fno-omit-frame-pointer -fsanitize=undefined")
-  elseif(MSVC)
-    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /fsanitize=undefined")
+    add_compile_options("-fsanitize=undefined" "-fno-sanitize-recover=undefined")
+    if (NOT WIN32)
+      add_link_options("-fsanitize=undefined")
+    endif()
+    if(MSVC)
+      add_compile_options("/Oy-")
+    else()
+      add_compile_options("-fno-omit-frame-pointer")
+    endif()
   else()
-    message(SEND_ERROR "UndefinedBehaviorSanitizer support requires clang, gcc, or msvc. Try again with -DCMAKE_C_COMPILER.")
+    message(SEND_ERROR "UndefinedBehaviorSanitizer support requires clang or gcc. Try again with -DCMAKE_C_COMPILER.")
   endif()
 endif()
 
@@ -181,7 +186,7 @@ set(uv_sources
     src/version.c)
 
 if(WIN32)
-  list(APPEND uv_defines WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0602 _CRT_DECLARE_NONSTDC_NAMES=0)
+  list(APPEND uv_defines WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 _CRT_DECLARE_NONSTDC_NAMES=0)
   list(APPEND uv_libraries
        psapi
        user32
@@ -662,6 +667,7 @@ if(LIBUV_BUILD_TESTS)
        test/test-thread-affinity.c
        test/test-thread-equal.c
        test/test-thread.c
+       test/test-thread-name.c
        test/test-thread-priority.c
        test/test-threadpool-cancel.c
        test/test-threadpool.c
